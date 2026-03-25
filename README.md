@@ -1,1 +1,3 @@
-# voltguard-energy-dashboard-242137
+# Project Repository
+
+This is the initial README file for the project.
