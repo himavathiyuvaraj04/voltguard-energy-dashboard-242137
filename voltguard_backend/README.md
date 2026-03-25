@@ -20,6 +20,15 @@ This folder contains the VoltGuard Flask backend implementation (SQLite storage,
 - `CORS_SUPPORTS_CREDENTIALS` (default `true`; auto-disabled if origins contains `"*"`)
 - `NODE_ENV` (if `development`, enables Flask debug mode)
 
+### Demo seed data (so UI shows data without CSV upload)
+
+- `VOLTGUARD_SEED_DEMO_DATA` (default `true`)  
+  If `false`, the backend will not auto-seed demo meter readings.
+- `VOLTGUARD_SEED_DAYS` (default `60`)  
+  Number of days of hourly readings to generate.
+- `VOLTGUARD_DEMO_CUSTOMER_ID` (default `demo_customer`)
+- `VOLTGUARD_DEMO_SITE_ID` (default `demo_site`)
+
 ## Install & run (example)
 
 Create a virtualenv and install dependencies:

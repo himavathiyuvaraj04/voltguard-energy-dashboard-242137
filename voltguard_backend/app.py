@@ -21,6 +21,7 @@ Environment variables (recommended):
 
 import os
 import sqlite3
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
@@ -128,6 +129,129 @@ def _init_db() -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _db_has_any_meter_readings() -> bool:
+    """Check whether the DB already contains meter readings."""
+    conn = _get_connection()
+    try:
+        row = conn.execute("SELECT 1 FROM meter_readings LIMIT 1").fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def _generate_demo_meter_df(days: int = 60) -> pd.DataFrame:
+    """
+    Generate a demo meter-readings dataframe for the past N days.
+
+    The dataset is designed to:
+      - Provide enough history for rolling-baseline analytics.
+      - Include a few intentional high-usage anomaly days so alerts appear immediately.
+
+    Returns:
+        pd.DataFrame with columns: timestamp, kWh
+    """
+    # Deterministic (no randomness) so demos are stable across runs.
+    end_day = date.today()
+    start_day = end_day - timedelta(days=max(1, days) - 1)
+
+    rows: list[dict[str, Any]] = []
+
+    # Base daily consumption (kWh). We'll vary by day-of-week.
+    base_weekday = 120.0
+    base_weekend = 90.0
+
+    # Choose anomaly offsets relative to the end of the range so there are recent alerts.
+    # These are "days ago" indexes within the generated range.
+    anomaly_days_ago = {2, 7, 14}  # 3 anomalies in the last 2 weeks
+    low_days_ago = {4}  # a low-ish day (won't create alert; kept for variety)
+
+    cur = start_day
+    while cur <= end_day:
+        days_ago = (end_day - cur).days
+        is_weekend = cur.weekday() >= 5
+
+        daily_total = base_weekend if is_weekend else base_weekday
+
+        # Gentle weekly seasonality by weekday (Mon..Sun): -5..+5
+        daily_total += (cur.weekday() - 3) * 2.0  # centered around Thu-ish
+
+        # Add anomalies: spike consumption on selected recent days
+        if days_ago in anomaly_days_ago:
+            daily_total *= 1.55  # clearly above 20% threshold
+        elif days_ago in low_days_ago:
+            daily_total *= 0.75
+
+        # Split daily total into 24 hourly readings. Keep simple.
+        per_hour = daily_total / 24.0
+        for h in range(24):
+            ts = datetime(cur.year, cur.month, cur.day, h, 0, 0)
+            rows.append(
+                {
+                    "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                    "kWh": float(per_hour),
+                }
+            )
+
+        cur = cur + timedelta(days=1)
+
+    return pd.DataFrame(rows, columns=["timestamp", "kWh"])
+
+
+def _seed_demo_data_if_needed() -> Dict[str, Any]:
+    """
+    Seed the database with demo meter readings (and derived alerts) if empty.
+
+    Seeding behavior is controlled by environment variables:
+      - VOLTGUARD_SEED_DEMO_DATA: default "true". If false, seeding is skipped.
+      - VOLTGUARD_SEED_DAYS: number of days of readings to generate (default 60).
+      - VOLTGUARD_DEMO_CUSTOMER_ID / VOLTGUARD_DEMO_SITE_ID: defaults match frontend.
+
+    Returns:
+        dict: {seeded: bool, inserted_rows: int, alerts_created: int, customer_id, site_id}
+    """
+    enabled = _get_env_bool("VOLTGUARD_SEED_DEMO_DATA", default=True)
+    if not enabled:
+        return {
+            "seeded": False,
+            "reason": "VOLTGUARD_SEED_DEMO_DATA disabled",
+            "inserted_rows": 0,
+            "alerts_created": 0,
+            "customer_id": os.getenv("VOLTGUARD_DEMO_CUSTOMER_ID", "demo_customer"),
+            "site_id": os.getenv("VOLTGUARD_DEMO_SITE_ID", "demo_site"),
+        }
+
+    if _db_has_any_meter_readings():
+        return {
+            "seeded": False,
+            "reason": "meter_readings already populated",
+            "inserted_rows": 0,
+            "alerts_created": 0,
+            "customer_id": os.getenv("VOLTGUARD_DEMO_CUSTOMER_ID", "demo_customer"),
+            "site_id": os.getenv("VOLTGUARD_DEMO_SITE_ID", "demo_site"),
+        }
+
+    customer_id = os.getenv("VOLTGUARD_DEMO_CUSTOMER_ID", "demo_customer")
+    site_id = os.getenv("VOLTGUARD_DEMO_SITE_ID", "demo_site")
+    days = int(os.getenv("VOLTGUARD_SEED_DAYS", "60"))
+
+    demo_df = _generate_demo_meter_df(days=days)
+    inserted = _insert_meter_readings(demo_df, customer_id=customer_id, site_id=site_id)
+
+    # Pre-create alerts so the UI can show alerts immediately even before /analytics is called.
+    readings = _fetch_meter_readings(customer_id=customer_id, site_id=site_id)
+    daily_analytics = _compute_daily_analytics(readings)
+    alerts_created = _upsert_alerts_from_anomalies(customer=customer_id, site=site_id, analytics=daily_analytics)
+
+    return {
+        "seeded": True,
+        "inserted_rows": int(inserted),
+        "alerts_created": int(alerts_created),
+        "customer_id": customer_id,
+        "site_id": site_id,
+        "days": int(days),
+    }
 
 
 def _parse_timestamp(ts: Any) -> Optional[pd.Timestamp]:
@@ -462,6 +586,10 @@ def create_app() -> Flask:
 
     # Ensure DB tables exist before serving requests.
     _init_db()
+
+    # Seed demo data so the dashboard shows analytics/alerts immediately (no CSV upload required).
+    # This is idempotent: it only runs when the meter_readings table is empty.
+    _seed_demo_data_if_needed()
 
     @app.errorhandler(404)
     def not_found(_err):
